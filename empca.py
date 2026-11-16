@@ -34,7 +34,7 @@ import numpy as np
 import sys
 from scipy.sparse import dia_matrix
 import scipy.sparse.linalg
-import math
+import math 
 
 class Model(object):
     """
@@ -469,7 +469,6 @@ class SavitzkyGolay(object):
         n = np.size(self._coeff-1)//2
         res = np.convolve(signal, self._coeff)
         return res[n:-n]
-
 
 def _main():
     np.random.seed(1)

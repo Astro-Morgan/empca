@@ -43,6 +43,46 @@ on toy example data, run
 
 This requires numpy and scipy; it will make plots if you have pylab installed.
 
+#### Fast implementations ####
+
+`empca.py` is the original serial reference implementation. Three drop-in
+vectorized versions with the same `Model`/`empca()` API give the same results
+to floating-point round-off (float64):
+
+- `empca_numpy.py` : vectorized numpy
+- `empca_torch.py` : PyTorch on CPU or CUDA (`device='cpu'|'cuda'`), requires torch
+- `empca_auto.py`  : picks the fastest backend for your machine and (nobs, nvar, nvec)
+
+    import empca_auto
+    m = empca_auto.empca(data, weights, nvec=5)             # automatic
+    m = empca_auto.empca(data, weights, backend='numpy')    # or force one
+    with empca_auto.use_backend('torch-cuda'): ...          # or force within a block
+
+For template building, all vectorized backends accept `subtract_mean=True`.
+By default (`mean_as_vector=True`) the weighted mean spectrum becomes a **fixed
+first basis vector** (normalised): it is fitted jointly with the learned vectors
+with a free amplitude per object, never updated, and the learned vectors are kept
+orthogonal to it. `subtract_mean_deriv=True` adds a second fixed vector, d(mean)/d(pixel)
+(optional `deriv_grid=`, e.g. log wavelength) with its component along the mean
+removed, the signature of a small redshift error. `nvec` counts the fixed vectors
+(`include_fixed_in_nvec=True`, default: nvec=5 gives mean + 4 learned); with
+`include_fixed_in_nvec=False` nvec vectors are learned in addition. `m.nfixed`,
+`m.mean`, `m.mean_deriv` describe them and `m.data` stays the raw data, so
+`m.set_data(new_raw, new_w)` works directly. The serial implementation cannot do this.
+`mean_as_vector=False` instead removes the mean at amplitude 1 plus each
+object's fitted amount of d(mean), fits EMPCA to the residuals (`m.data`), and
+`m.full_model()` rebuilds the originals (new data must then be preprocessed
+by hand). Pixels with zero total weight are left at 0 in learned vectors
+(the serial code gives NaN).
+Start vectors come from `empca_numpy.random_orthonormal`, which matches the
+serial helper but redraws degenerate vectors.
+
+`EMPCA_BACKEND=numpy` in the environment also forces a backend. Run
+`empca_auto.calibrate()` once to time all backends on your hardware (stored in
+`~/.cache/empca/calibration.json`, override with `EMPCA_CALIBRATION_FILE`);
+without a calibration, built-in size thresholds are used.
+Tests: `pytest test/`.  Scaling benchmarks: `python benchmarks/bench_scaling.py`.
+
 The paper S. Bailey 2012, PASP, 124, 1015 describes the underlying math
 and is available as a pre-print at:
 
