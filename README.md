@@ -54,9 +54,9 @@ to floating-point round-off (float64):
 - `empca_auto.py`  : picks the fastest backend for your machine and (nobs, nvar, nvec)
 
     import empca_auto
-    m = empca_auto.empca(data, weights, nvec=5)             # automatic
-    m = empca_auto.empca(data, weights, backend='numpy')    # or force one
-    with empca_auto.use_backend('torch-cuda'): ...          # or force within a block
+    - m = empca_auto.empca(data, weights, nvec=5)             # automatic
+    - m = empca_auto.empca(data, weights, backend='numpy')    # or force one
+    - with empca_auto.use_backend('torch-cuda'): ...          # or force within a block
 
 For template building, all vectorized backends accept `subtract_mean=True`.
 By default (`mean_as_vector=True`) the weighted mean spectrum becomes a **fixed
