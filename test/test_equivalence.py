@@ -74,6 +74,17 @@ def test_empca_matches_serial(impl, kw):
 
 
 @pytest.mark.parametrize('impl', IMPLS)
+def test_wide_basis_matches_serial(impl):
+    """nvec=20: exercises the Gram-matrix (GEMM) eigenvector update and the many-vector coefficient solve."""
+    _, fn, extra = impl
+    data, weights = make_problem(nobs=300, nvar=200, nvec=3, seed=4)
+    ref = serial.empca(data, weights, nvec=20, niter=10, silent=True)
+    got = fn(data, weights, nvec=20, niter=10, silent=True, **extra)
+    assert np.max(np.abs(got.eigvec - ref.eigvec)) < 1e-9
+    assert_models_equal(ref, got, rtol=1e-8, atol=1e-9)
+
+
+@pytest.mark.parametrize('impl', IMPLS)
 def test_default_weights_none(impl):
     _, fn, extra = impl
     data, _ = make_problem(nobs=40, nvar=50)

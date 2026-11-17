@@ -50,6 +50,16 @@ def _to_dev(a, device):
     return torch.as_tensor(np.ascontiguousarray(a, dtype=np.float64), device=device)
 
 
+def _upload64(a, device):
+    """Upload a 2-D array and return a C-contiguous float64 device tensor.  The layout fix-up and the dtype conversion
+    run on the device: np.ascontiguousarray on a Fortran-ordered or strided host array (e.g. the result of ``F[:, keep]``)
+    is a ~1 s host copy per 700 MB, while the same transpose on the GPU takes milliseconds."""
+    a = np.asarray(a)
+    if a.ndim == 2 and not a.flags.c_contiguous and a.flags.f_contiguous:
+        return torch.as_tensor(a.T, device=device).T.contiguous().to(torch.float64)
+    return torch.as_tensor(np.ascontiguousarray(a), device=device).to(torch.float64)
+
+
 def _blocks(n, ncols):
     step = max(1, _BLOCK_ELEMENTS // max(1, ncols))
     for s in range(0, n, step):
@@ -57,16 +67,68 @@ def _blocks(n, ncols):
 
 
 class _State(object):
-    """Device-resident copies of data/weights plus the row-uniformity split."""
+    """Device-resident copies of data/weights plus the row-uniformity split.
+
+    Speed-ups vs the original: the arrays are uploaded in their native dtype and converted to float64 on the
+    device (half the PCIe traffic for float32 input), the 'uniform row' test runs on the device (the host test
+    was a full N x L numpy pass), and W*D is formed once (it is constant) instead of in every iteration.
+    """
 
     def __init__(self, data, weights, device):
         self.device = device
-        self.D = _to_dev(data, device)
-        self.W = _to_dev(weights, device)
-        uniform = _np_impl._uniform_rows(np.asarray(weights))
-        self.uniform_idx = torch.as_tensor(np.flatnonzero(uniform), device=device)
-        self.nonuniform_idx = torch.as_tensor(np.flatnonzero(~uniform), device=device)
+        self.D = _upload64(data, device)
+        self.W = _upload64(weights, device)
+        self.WD = self.W * self.D
+        uniform = ~torch.any(self.W != self.W[:, :1], dim=1)
+        self.uniform_idx = torch.nonzero(uniform).squeeze(1)
+        self.nonuniform_idx = torch.nonzero(~uniform).squeeze(1)
         self.all_nonuniform = self.uniform_idx.numel() == 0
+        self.data_var = None                       # lazily: variance of the unmasked data
+
+
+@torch.no_grad()
+def _masked_var(st, X=None):
+    """Population variance of X[W>0] (X defaults to the data) without a boolean gather: two blockwise passes."""
+    X = st.D if X is None else X
+    n = 0
+    s = torch.zeros((), dtype=torch.float64, device=st.device)
+    blocks = list(_blocks(X.shape[0], X.shape[1]))
+    for a, b in blocks:
+        m = st.W[a:b] > 0
+        n += int(m.sum())
+        s += torch.where(m, X[a:b], 0.0).sum()
+    mean = s / max(n, 1)
+    ss = torch.zeros((), dtype=torch.float64, device=st.device)
+    for a, b in blocks:
+        m = st.W[a:b] > 0
+        ss += (torch.where(m, X[a:b] - mean, 0.0) ** 2).sum()
+    return float(ss / max(n, 1))
+
+
+@torch.no_grad()
+def _fit_stats(st, C, V):
+    """(R2, chi2) of the model C @ V, computed blockwise on the device (no N x L host or gather passes)."""
+    if st.data_var is None:
+        st.data_var = _masked_var(st)
+    n = 0
+    s = torch.zeros((), dtype=torch.float64, device=st.device)
+    chi2 = torch.zeros((), dtype=torch.float64, device=st.device)
+    blocks = list(_blocks(st.D.shape[0], st.D.shape[1]))
+    for a, b in blocks:
+        d = C[a:b] @ V - st.D[a:b]
+        w = st.W[a:b]
+        m = w > 0
+        n += int(m.sum())
+        s += torch.where(m, d, 0.0).sum()
+        chi2 += (w * d * d).sum()
+    mean = s / max(n, 1)
+    ss = torch.zeros((), dtype=torch.float64, device=st.device)
+    for a, b in blocks:
+        d = C[a:b] @ V - st.D[a:b]
+        m = st.W[a:b] > 0
+        ss += (torch.where(m, d - mean, 0.0) ** 2).sum()
+    var_d = float(ss) / max(n, 1)
+    return 1.0 - var_d / st.data_var, float(chi2)
 
 
 @torch.no_grad()
@@ -103,35 +165,49 @@ def _coeffs(st, V):
 
     P = (V[:, None, :] * V[None, :, :]).reshape(nvec * nvec, nvar)
     idx = st.nonuniform_idx
-    for s, e in _blocks(idx.numel(), nvar):
-        rows = idx[s:e]
-        if st.all_nonuniform:                      # avoid a gather copy
-            w, d = st.W[s:e], st.D[s:e]
-        else:
-            w, d = st.W[rows], st.D[rows]
-        M = (w @ P.T).reshape(-1, nvec, nvec)
-        b = (w * d) @ V.T
-        C[rows] = _solve_normal(M, b)
+    n = idx.numel()
+    if n:
+        # the two skinny GEMMs run block-wise over the constant matrices (bounded temporaries when rows must be
+        # gathered); the tiny [n, nvec, nvec] normal equations are then solved ONCE (one Cholesky, one sync) instead of
+        # once per block
+        M = torch.empty(n, nvec * nvec, dtype=torch.float64, device=st.device)
+        b = torch.empty(n, nvec, dtype=torch.float64, device=st.device)
+        for s, e in _blocks(n, nvar):
+            if st.all_nonuniform:                      # avoid a gather copy
+                w, wd = st.W[s:e], st.WD[s:e]
+            else:
+                rows = idx[s:e]
+                w, wd = st.W[rows], st.WD[rows]
+            M[s:e] = w @ P.T
+            b[s:e] = wd @ V.T
+        C[idx] = _solve_normal(M.reshape(n, nvec, nvec), b)
     return C
 
 
 @torch.no_grad()
 def _eigvecs(st, C, V, smooth=None, nfixed=0):
-    """Sequential eigenvector update; returns new (un-orthonormalised) V clone."""
+    """Sequential eigenvector update; returns new (un-orthonormalised) V clone.
+
+    Same Gauss-Seidel update as before, V_k = sum_i c_ik w_ij (d_ij - sum_{l<k} c_il V_lj) / sum_i c_ik^2 w_ij, but the
+    sums over observations are all done up front with two GEMMs over the constant matrices (the numerators need
+    G1[j,k] = sum_i c_ik w_ij d_ij and the pair sums G2[j,k,l] = sum_i c_ik c_il w_ij); the sequential part is then
+    a handful of length-nvar vector operations.  The original cloned D and made ~6 full N x L passes per vector.
+    """
+    nobs, nvec = C.shape
+    nvar = V.shape[1]
     V = V.clone()
-    X = st.D.clone()
-    if nfixed:
-        X -= C[:, :nfixed] @ V[:nfixed]
-    for k in range(nfixed, V.shape[0]):
-        c = C[:, k]
-        cw = c[:, None] * st.W
-        num = (X * cw).sum(0)
-        den = c @ cw
+    G1 = st.WD.T @ C                                                    # [nvar, nvec]
+    Q = (C[:, :, None] * C[:, None, :]).reshape(nobs, nvec * nvec)       # [nobs, nvec^2]
+    G2 = (st.W.T @ Q).reshape(nvar, nvec, nvec)                          # [nvar, nvec, nvec]
+    for k in range(nfixed, nvec):
+        num = G1[:, k].clone()
+        for l in range(k):
+            num -= V[l] * G2[:, k, l]
+        den = G2[:, k, k]
         V[k] = torch.where(den > 0, num / den, torch.zeros_like(num))   # unconstrained pixel -> 0 (serial: NaN)
         if smooth is not None:
             v = smooth(V[k].cpu().numpy())
             V[k] = torch.as_tensor(np.ascontiguousarray(v, dtype=np.float64), device=V.device)
-        X -= c[:, None] * V[k][None, :]
     return V
 
 
@@ -146,23 +222,78 @@ class Model(_serial.Model):
     """
     Same interface as ``empca.Model``; computation runs in torch on ``device``.
     All public attributes (eigvec, data, weights, coeff, model) are numpy arrays.
+
+    Speed-ups vs the original: ``state=`` lets empca() hand over its device-resident data instead of uploading
+    everything a second time, the degrees of freedom are counted on the device, and the bookkeeping that needs a
+    full host pass (``model``, ``_unmasked``, ``_unmasked_data_var``) is computed lazily on first use, so building the
+    returned Model no longer costs several seconds at large N.  All values are unchanged.
     """
 
-    def __init__(self, eigvec, data, weights, device=None, nfixed=0):
+    def __init__(self, eigvec, data, weights, device=None, nfixed=0, state=None):
         self.nfixed = nfixed
         self.device = resolve_device(device)
-        super(Model, self).__init__(eigvec, data, weights)
+        self._given_state = state
+        self.eigvec = eigvec
+        self.nvec = eigvec.shape[0]
+        self.set_data(data, weights)
+
+    # -- lazily built host quantities --------------------------------------------------------------
+    @property
+    def model(self):
+        if self._model is None:
+            self._model = (self._C_dev @ _to_dev(self.eigvec, self.device)).cpu().numpy()
+        return self._model
+
+    @model.setter
+    def model(self, value):
+        self._model = value
+
+    @property
+    def _unmasked(self):
+        if self.__dict__.get('_unmasked_cache') is None:
+            self._unmasked_cache = np.where(self.weights > 0)
+        return self._unmasked_cache
+
+    @property
+    def _unmasked_data_var(self):
+        if self.__dict__.get('_uvar') is None:
+            if self._st.data_var is None:
+                self._st.data_var = _masked_var(self._st)
+            self._uvar = self._st.data_var
+        return self._uvar
+
+    def _stats(self):
+        return _fit_stats(self._st, self._C_dev, _to_dev(self.eigvec, self.device))
+
+    def chi2(self):
+        """Returns sum( (model-data)^2 * weights ), computed on the device."""
+        return self._stats()[1]
+
+    def R2(self, nvec=None):
+        """Fraction of unmasked data variance explained (device-side for the full model)."""
+        if nvec is not None:
+            return super(Model, self).R2(nvec)
+        return self._stats()[0]
 
     def set_data(self, data, weights):
-        self._st = _State(data, weights, self.device)
-        super(Model, self).set_data(data, weights)
+        self._st = self._given_state if self._given_state is not None else _State(data, weights, self.device)
+        self._given_state = None
+        self.data = data
+        self.weights = weights
+        self.nobs, self.nvar = data.shape
+        self.coeff = np.zeros((self.nobs, self.nvec))
+        self._model = None
+        self._unmasked_cache = None
+        self._uvar = None
+        self.dof = int(torch.count_nonzero(self._st.W > 0)) - self.eigvec.size - self.nvec * self.nobs
         self.dof += self.nfixed * self.nvar          # fixed vectors are not fitted parameters
+        self.solve_coeffs()
 
     def solve_coeffs(self):
         V = _to_dev(self.eigvec, self.device)
-        C = _coeffs(self._st, V)
-        self.coeff[...] = C.cpu().numpy()
-        self.solve_model()
+        self._C_dev = _coeffs(self._st, V)
+        self.coeff[...] = self._C_dev.cpu().numpy()
+        self._model = None                            # rebuilt on demand
 
     def solve_eigenvectors(self, smooth=None):
         V = _to_dev(self.eigvec, self.device)
@@ -170,12 +301,12 @@ class Model(_serial.Model):
         V = _eigvecs(self._st, C, V, smooth, self.nfixed)
         V = _orthonormalize_dev(V, self.nfixed)
         self.eigvec[...] = V.cpu().numpy()
-        self.solve_model()
+        self._C_dev = C
+        self._model = None
 
     def solve_model(self):
-        V = _to_dev(self.eigvec, self.device)
-        C = _to_dev(self.coeff, self.device)
-        self.model[...] = (C @ V).cpu().numpy()
+        self._C_dev = _to_dev(self.coeff, self.device)
+        self._model = None
 
 
 def empca(data, weights=None, niter=25, nvec=5, smooth=0, randseed=1, silent=False,
@@ -222,26 +353,20 @@ def empca(data, weights=None, niter=25, nvec=5, smooth=0, randseed=1, silent=Fal
 
     if not silent:
         print("       iter        R2             rchi2")
-        mask = st.W > 0
-        dof = int(mask.sum()) - (ntotal - nfixed) * nvar - ntotal * nobs
-        sel_data = st.D[mask]
-        data_var = torch.var(sel_data, unbiased=False)
-        sqrtw = torch.sqrt(st.W)
+        dof = int(torch.count_nonzero(st.W > 0)) - (ntotal - nfixed) * nvar - ntotal * nobs
 
     for k in range(niter):
         C = _coeffs(st, V)
         V = _orthonormalize_dev(_eigvecs(st, C, V, smooth, nfixed), nfixed)
         if not silent:
             # as in the serial code: model from this iteration's coeffs and new eigvec
-            mdl = C @ V
-            R2 = 1.0 - torch.var((mdl - st.D)[mask], unbiased=False) / data_var
-            chi2 = torch.sum(((mdl - st.D) * sqrtw) ** 2)
+            R2, chi2 = _fit_stats(st, C, V)
             print('EMPCA %2d/%2d  %15.8f %15.8f' %
-                  (k + 1, niter, float(R2), float(chi2) / dof))
+                  (k + 1, niter, R2, chi2 / dof))
             sys.stdout.flush()
 
     # Final coefficients/model for the latest eigenvectors (done by Model.set_data)
-    model = Model(V.cpu().numpy().copy(), data, weights, device=device, nfixed=nfixed)
+    model = Model(V.cpu().numpy().copy(), data, weights, device=device, nfixed=nfixed, state=st)
 
     if not silent:
         print("R2:", model.R2())

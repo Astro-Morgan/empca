@@ -393,33 +393,31 @@ class Model(_serial.Model):
         self.solve_model()
 
     def solve_eigenvectors(self, smooth=None):
-        """Solve for eigvec[k,j] such that data[i] = Sum_k: coeff[i,k] eigvec[k]"""
+        """
+        Solve for eigvec[k,j] such that data[i] = Sum_k: coeff[i,k] eigvec[k]
+
+        The Gauss-Seidel update V_k = sum_i c_ik w_ij (d_ij - sum_{l<k} c_il V_lj) / sum_i c_ik^2 w_ij
+        only needs G1[j,k] = sum_i c_ik w_ij d_ij and G2[j,k,l] = sum_i c_ik c_il w_ij, formed up front
+        with GEMMs (blockwise over observations); the sequential part is then nvec^2 vector operations.
+        """
         D, W, C = self.data, self.weights, self.coeff
-        blocks = list(_row_blocks(self.nobs, self.nvar, _EIG_BLOCK_ELEMENTS))
-        step = blocks[0].stop - blocks[0].start
-        xbuf = np.empty((step, self.nvar))       # reused scratch: avoids per-block allocation
-        cwbuf = np.empty((step, self.nvar))
-        for k in range(self.nfixed, self.nvec):
-            # x = data with the (already updated) vectors 0..k-1 removed, built
-            # block-by-block so the temporaries stay cache resident.
-            num = np.zeros(self.nvar)
-            den = np.zeros(self.nvar)
-            for sl in blocks:
-                n = sl.stop - sl.start
-                c = C[sl, k]
-                if k == 0:
-                    x = D[sl]
-                else:
-                    x = xbuf[:n]
-                    np.matmul(C[sl, :k], self.eigvec[:k], out=x)
-                    np.subtract(D[sl], x, out=x)
-                cw = cwbuf[:n]
-                np.multiply(c[:, None], W[sl], out=cw)
-                num += np.einsum('ij,ij->j', x, cw)    # sum_i x_ij c_i w_ij
-                den += c @ cw                          # sum_i c_i^2 w_ij
+        nvec, nvar = self.nvec, self.nvar
+        G1 = np.zeros((nvar, nvec))
+        G2 = np.zeros((nvar, nvec * nvec))
+        for sl in _row_blocks(self.nobs, max(nvar, nvec * nvec), _EIG_BLOCK_ELEMENTS):
+            c, w = C[sl], W[sl]
+            G1 += (w * D[sl]).T @ c
+            G2 += w.T @ (c[:, :, None] * c[:, None, :]).reshape(c.shape[0], nvec * nvec)
+        G2 = G2.reshape(nvar, nvec, nvec)
+
+        for k in range(self.nfixed, nvec):
+            num = G1[:, k].copy()
+            for l in range(k):
+                num -= self.eigvec[l] * G2[:, k, l]
+            den = G2[:, k, k]
             # A pixel with zero total weight is unconstrained (serial code: 0/0 = NaN
             # that then poisons every coefficient); give it a zero component.
-            self.eigvec[k] = np.divide(num, den, out=np.zeros(self.nvar), where=den > 0)
+            self.eigvec[k] = np.divide(num, den, out=np.zeros(nvar), where=den > 0)
 
             if smooth is not None:
                 self.eigvec[k] = smooth(self.eigvec[k])
